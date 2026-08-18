@@ -1,6 +1,6 @@
 ---
 name: wecom-invoice-import-v2.0
-description: "把税务局导出的Excel发票记录批量录入到企微在线表格，并在录入前按开票人规则处理「是否邮件开票」列（V2.0）。当用户说'开票实习生同步开票记录'、'把昨天的开票记录录入企微'、'按开票人筛选后录入发票'、'导入发票到企微文档并标记邮件开票'、'发票登记V2'时使用。规则：开票人=符瑞香→直接录入；开票人=伍惠娟→录入并在「是否邮件开票」填'是'；其他开票人→报异常转人工。复用 V1 的 dev-browser 浏览器自动化+剪贴板TSV粘贴技术，绕过企微无API权限/无企业认证的限制。"
+description: "把税务局导出的Excel发票记录批量录入到企微在线表格，并在录入前按开票人规则处理「是否邮件开票」列（V2.0）。当用户说'开票实习生同步开票记录'、'把昨天的开票记录录入企微'、'按开票人筛选后录入发票'、'导入发票到企微文档并标记邮件开票'、'发票登记V2'，或直接上传Excel文件要求同步时使用。规则：开票人=符瑞香→直接录入；开票人=伍惠娟→录入并在「是否邮件开票」填'是'；其他开票人→报异常转人工。复用 V1 的 dev-browser 浏览器自动化+剪贴板TSV粘贴技术，绕过企微无API权限/无企业认证的限制。"
 version: 2.0.0
 tier: write_with_safety_guard
 priority: high
@@ -51,17 +51,17 @@ agent_created: true
 | # | 信息 | 说明 |
 |---|------|------|
 | 1 | 企微文档分享链接 | `https://doc.weixin.qq.com/sheet/xxx`。脚本支持从输入 JSON 的 `doc_url` 字段传入；缺省用脚本内默认链接 |
-| 2 | Excel文件夹路径 | 如 `D:\开票记录\` |
-| 3 | Excel文件名规则 | `{当天MMDD}全量发票查询导出结果.xlsx`（如今天7/28→`0728全量发票查询导出结果.xlsx`）。可能带` (1)`后缀，查找时用glob `{MMDD}全量发票查询导出结果*.xlsx` |
 
-**文件查找逻辑**：取当天日期格式化为 MMDD，在文件夹里查找匹配文件。注意：文件内容是**昨天的开票记录**，但文件名里的日期是**当天的**（导出日期）。
+**Excel 来源**：由用户直接上传/提供 Excel 文件，取其绝对路径作为第1步的输入。**无需**配置文件夹路径或文件名规则。
 
 ## 执行流程（2步）
 
-### 第1步：读取Excel生成18列TSV（含开票人分流）
+### 第1步：读取用户上传的Excel生成18列TSV（含开票人分流）
+
+用户直接上传/提供 Excel 文件后，取其绝对路径运行：
 
 ```bash
-python "<skill目录>/scripts/read_excel_to_tsv.py" "<excel文件路径>" > tsv.tsv
+python "<skill目录>/scripts/read_excel_to_tsv.py" "<用户上传的excel文件路径>" > tsv.tsv
 ```
 
 脚本读取「信息汇总表」sheet，跳过表头和合计行，按开票人规则分流，输出 **18列TSV** 到 stdout，统计信息与异常明细到 stderr。
@@ -98,12 +98,14 @@ python "<skill目录>/scripts/read_excel_to_tsv.py" "<excel文件路径>" > tsv.
 {
   "tsv": "<第1步的18列TSV全文>",
   "doc_url": "https://doc.weixin.qq.com/sheet/...",
-  "force": false
+  "force": false,
+  "skip_duplicates": false
 }
 ```
 - `tsv` 必填，18列TSV
 - `doc_url` 可选，缺省用脚本内默认链接
-- `force` 可选，默认 false；true=即使发现重复也强制录入全部（慎用）
+- `force` 可选，默认 false；true=即使发现重复也强制录入全部（慎用，会重复）
+- `skip_duplicates` 可选，默认 false；true=跳过重复行，**只录入新增**（适合"删了部分记录要补回"的场景，不会重复录入还在表格里的记录）
 
 **运行脚本**：
 
@@ -115,9 +117,9 @@ dev-browser --browser wecom --idle-timeout 30m --timeout 240 run "<skill目录>/
 
 脚本分 8 步执行，每步打印 `[步骤 n/8]` 进度日志：
 1. 全新加载企微文档（清残留态防幽灵粘贴）
-2. 等待引擎+Sheet 就绪
-3. 全表查重（一次 evaluate 读全表发票号码，与 TSV 比对）
-4. 导航到空行（A列起，不Tab）
+2. 等待引擎+Sheet 就绪，**并探活关键接口**（确认读写/导航接口都在，自动判定用 `setCurrentSelection` 还是 `setActiveCell`）
+3. 全表查重（**先等数据加载稳定**，再一次 evaluate 读全表发票号码，与 TSV 比对）
+4. 导航到空行（按探活结果选导航方式，A列起，不Tab）
 5. **粘贴前校验目标行为空**（防幽灵粘贴，非空即停手）
 6. 粘贴 18列TSV
 7. 读回验证列对齐（日期col2/发票号col4/订单号col9/**邮件开票col17**）
@@ -137,6 +139,7 @@ dev-browser --browser wecom --idle-timeout 30m --timeout 240 run "<skill目录>/
 | `alignment_failed` | 部分行列未对齐 | 看 `readback_sample`，人工核查 |
 | `persistence_failed` | 刷新后数据丢失 | 粘贴可能未触发提交，重跑 |
 | `app_not_ready` / `no_input` | 引擎未就绪 / 无输入 | 检查登录态或输入文件 |
+| `engine_api_changed` | 探活发现关键接口缺失 | 看输出 `missing`（缺哪个接口）和 `dump`（现有方法列表/函数源码），据此更新脚本 |
 
 ## 关键技术要点（为什么这样做）
 
@@ -150,15 +153,21 @@ dev-browser --browser wecom --idle-timeout 30m --timeout 240 run "<skill目录>/
 
 5. **全量查重**：一次 evaluate 读全表所有发票号码（col4），与 TSV 比对。比"只查最近2日期"更安全，能拦住跨天补录的重复。
 
-6. **开票人分流在 Python 侧完成**：Python 读 Excel 时顺带取「开票人」列(col26)，直接决定 col17 填"是"还是空。异常开票人在进入 JS 前就被拦下，JS 无需关心开票人。
+6. **⚠️ 数据渐进加载，查重/验证前必须等稳定**：企微表格的 canvas 数据是**异步分批渲染**的——`page.goto` 后立即扫描，`getCellDataAtPosition` 只能读到已加载的部分行（实测：刚加载完只读到 60 条，约 1.5s 后才到 82 条）。若不等稳定就查重，会漏掉尚未加载的记录，`lastRow` 也会算小，导致粘贴时**覆盖已有数据**。脚本用 `waitForDataStable()` 轮询 `lastRow`，连续两次一致才继续。
 
-7. **page.cua.click vs page.locator.click**：企微有 `operate-board` 覆盖层拦截DOM点击。page.cua.click 通过 CDP 发送原始鼠标事件，绕过拦截。
+7. **⚠️ lastRow 必须以「发票号码(col4)」为锚，不能看「任意列非空」**：表格底部可能残留杂散数据（实测：row 5842 有一格孤立的日期 `2099/12/31`）。若用"任意列非空"判断最后一行，会把底部杂散数据误判成最后一条记录，导致粘贴到错误位置（row 5843 而不是 row 159）。所以 `fullScan` 里 `lastRow` 只在 col4（发票号码）非空时才更新，杂散数据自然被忽略。
 
-8. **Ctrl+V vs keyboard.type**：canvas表格编辑模式不响应 type 的键盘事件。粘贴走浏览器原生 paste 事件，表格有完整处理逻辑，自动触发 mutation 提交。
+8. **⚠️ 接口探活 + 导航双写**：企微引擎会不定期改内部接口（本次 `sheet.setActiveCell` 被移除）。脚本开头 `probeEngine()` 会检查关键接口是否都在，并自动判定导航方式——**优先 `app.view.setCurrentSelection({yRange:[r,r], xRange:[c,c]})`，退回老接口 `sheet.setActiveCell(r,0)`**。若关键接口缺失，`dumpEngine()` 会把 sheet/view 的方法列表和函数源码倒出来，输出 `engine_api_changed` 供定位新写法，而不是中途崩。注意 `app.view` 是**异步初始化**的，探活要轮询等它就绪。dev-browser 的 `page.evaluate` 只允许传 **1 个参数**，多参数要包进一个对象 `{start, n}`。
 
-9. **必须刷新验证**：只有刷新后数据还在，才确认提交到服务器。
+9. **开票人分流在 Python 侧完成**：Python 读 Excel 时顺带取「开票人」列(col26)，直接决定 col17 填"是"还是空。异常开票人在进入 JS 前就被拦下，JS 无需关心开票人。
 
-10. **引擎行号 vs UI行号**：引擎 row 0 = UI row 1（表头），引擎 row N = UI row N+1。
+10. **page.cua.click vs page.locator.click**：企微有 `operate-board` 覆盖层拦截DOM点击。page.cua.click 通过 CDP 发送原始鼠标事件，绕过拦截。
+
+11. **Ctrl+V vs keyboard.type**：canvas表格编辑模式不响应 type 的键盘事件。粘贴走浏览器原生 paste 事件，表格有完整处理逻辑，自动触发 mutation 提交。
+
+12. **必须刷新验证**：只有刷新后数据还在，才确认提交到服务器。
+
+13. **引擎行号 vs UI行号**：引擎 row 0 = UI row 1（表头），引擎 row N = UI row N+1。`setCurrentSelection` 的 `yRange` 与引擎 `getCellDataAtPosition` 的 row 索引一致。
 
 ## 故障排查
 
@@ -171,6 +180,9 @@ dev-browser --browser wecom --idle-timeout 30m --timeout 240 run "<skill目录>/
 | 刷新后数据丢失 | 粘贴没触发提交 | 确认选中了正确单元格再粘贴，重跑 |
 | col17「是否邮件开票」没填上 | TSV 没带 col17 或列数不对 | 确认 read_excel_to_tsv.py 输出了 18 列，且第18列是"是"/空 |
 | 退出码 2 | 发现异常开票人 | 看 stderr 异常明细，转人工，不要录入异常记录 |
+| `sheet.setActiveCell is not a function` | 引擎已移除该 API | 改用 `app.view.setCurrentSelection({yRange:[r,r], xRange:[c,c]})` |
+| 查重漏行 / lastRow 算小 | 数据渐进加载，扫描过早 | 脚本已用 `waitForDataStable` 等 lastRow 稳定；若仍漏，增大轮询次数/间隔 |
+| `Too many arguments` (evaluate) | dev-browser 只允许 1 个参数 | 多参数包成对象 `{start, n}` 传入 |
 
 ## 批量粘贴注意事项
 
