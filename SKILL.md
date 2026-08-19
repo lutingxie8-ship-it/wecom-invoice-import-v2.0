@@ -1,6 +1,6 @@
 ---
 name: wecom-invoice-import-v2.0
-description: "把税务局导出的Excel发票记录批量录入到企微在线表格，并在录入前按开票人规则处理「是否邮件开票」列（V2.0）。当用户说'开票实习生同步开票记录'、'把昨天的开票记录录入企微'、'按开票人筛选后录入发票'、'导入发票到企微文档并标记邮件开票'、'发票登记V2'，或直接上传Excel文件要求同步时使用。规则：开票人=符瑞香→直接录入；开票人=伍惠娟→录入并在「是否邮件开票」填'是'；其他开票人→报异常转人工。复用 V1 的 dev-browser 浏览器自动化+剪贴板TSV粘贴技术，绕过企微无API权限/无企业认证的限制。"
+description: "把税务局导出的发票 Excel 批量录入到企微在线表格，并按开票人自动填写「是否邮件开票」列。当用户上传/提供一个税务局导出的 xlsx、或说'同步昨天的开票记录'、'开票实习生同步'、'把发票录入企微'、'导入发票到企微文档'、'批量录入开票记录'、'发票登记'、'录发票'时使用——只要是在同步/录入税务局开票记录，即使用户没明说'发票'也要用这个 skill。规则：开票人=符瑞香→直接录入；开票人=伍惠娟→录入并在「是否邮件开票」填'是'；其他开票人→报异常转人工。用 dev-browser 浏览器自动化+剪贴板粘贴，绕过企微无 API 权限/无企业认证的限制。"
 version: 2.0.0
 tier: write_with_safety_guard
 priority: high
@@ -82,8 +82,8 @@ python "<skill目录>/scripts/read_excel_to_tsv.py" "<用户上传的excel文件
 | 发票类型(col5) | 22 | 直接取 |
 | 开票名称(col6) | 8 | 直接取 |
 | 纳税人识别号(col7) | 7 | None→空字符串 |
-| 开票金额(col8) | 20 | 直接取 |
-| 订单ID(col9) | 27 | 直接取 |
+| 开票金额(col8) | 20 | 直接取；**可能为负（红冲发票），照填** |
+| 订单ID(col9) | 27 | 直接取；**可能为空（客户要求，属正常，不阻塞录入）** |
 | col10~col16 | — | 留空（备注/归属项目/备注_1/订单ID是否重复/年/月/货物或应税劳务名称） |
 | **是否邮件开票(col17)** | **26(开票人)** | **伍惠娟→"是"，符瑞香→""** |
 
@@ -117,8 +117,9 @@ dev-browser --browser wecom --idle-timeout 30m --timeout 240 run "<skill目录>/
 
 脚本分 8 步执行，每步打印 `[步骤 n/8]` 进度日志：
 1. 全新加载企微文档（清残留态防幽灵粘贴）
-2. 等待引擎+Sheet 就绪，**并探活关键接口**（确认读写/导航接口都在，自动判定用 `setCurrentSelection` 还是 `setActiveCell`）
+2. 等待引擎+Sheet 就绪，**并探活关键接口**（自动探测新旧引擎结构、读写/导航接口，自动判定用 `setCurrentSelection` 还是 `setActiveCell`，并探测是否支持 `insertDimension` 插行）
 3. 全表查重（**先等数据加载稳定**，再一次 evaluate 读全表发票号码，与 TSV 比对）
+3.5 **行满检测**：若「目标行 + 待录条数」超出表格总行数，自动 `insertDimension` 扩行（详见技术要点 #17）
 4. 导航到空行（按探活结果选导航方式，A列起，不Tab）
 5. **粘贴前校验目标行为空**（防幽灵粘贴，非空即停手）
 6. 粘贴 18列TSV
@@ -140,6 +141,7 @@ dev-browser --browser wecom --idle-timeout 30m --timeout 240 run "<skill目录>/
 | `persistence_failed` | 刷新后数据丢失 | 粘贴可能未触发提交，重跑 |
 | `app_not_ready` / `no_input` | 引擎未就绪 / 无输入 | 检查登录态或输入文件 |
 | `engine_api_changed` | 探活发现关键接口缺失 | 看输出 `missing`（缺哪个接口）和 `dump`（现有方法列表/函数源码），据此更新脚本 |
+| `row_full_manual_expand` | 表格行满，且引擎未暴露插行 API | 看输出 `need_rows`，手动在表格底部加相应行数后重试 |
 
 ## 关键技术要点（为什么这样做）
 
@@ -169,6 +171,26 @@ dev-browser --browser wecom --idle-timeout 30m --timeout 240 run "<skill目录>/
 
 13. **引擎行号 vs UI行号**：引擎 row 0 = UI row 1（表头），引擎 row N = UI row N+1。`setCurrentSelection` 的 `yRange` 与引擎 `getCellDataAtPosition` 的 row 索引一致。
 
+14. **订单号(col9)允许为空（客户要求）**：对齐校验只看 日期(col2) + 发票号(col4) + 邮件开票(col17)，**订单号不作为对齐判据**。若存在订单号为空的记录，照常录入，但完成后会在输出里带 `empty_order_count` / `empty_order_nums` 告知用户（哪些发票号订单号为空），供人工知晓。
+
+15. **红冲发票（金额为负）直接录入、不中断**：红字发票（红冲）金额为负（col8，如 `-2380`），是冲销之前发票的正常业务，**照常录入、不中途打断询问**，金额为负也照填。脚本会在读回时统计红冲条数，完成后在输出里带 `redletter_count` / `redletter_list`（发票号+金额）供事后汇报，不在录入过程中停顿。
+
+16. **⚠️ 引擎结构探测式兼容（新旧引擎取 sheet）**：企微表格引擎存在两套「取 sheet」结构，不同文档/版本走不同结构，**硬编码会 `app_not_ready`**：
+
+    | | 旧引擎 | 新引擎 |
+    |---|---|---|
+    | 取 sheet 入口 | `app.workbook.worksheetManager` | `app.spreadsheet.sheetManager` |
+    | 拿当前 sheet id | `activeSheetId`（**属性**） | `getActiveSheetId()`（**方法**） |
+    | getSheetBySheetId / getRowCount / getCellDataAtPosition | ✅ | ✅ 一致 |
+
+    脚本统一走 `window.__wbSheet.resolve(app)`（`installHelpers()` 挂到 window 全局，`goto` 刷新后需重挂），自动识别新旧引擎再取 sheet。`waitForAppReady`/`waitForSheetReady` 内联了同样的兼容判断（它们最先跑、helper 还没挂）。探活时会把 `engine` 类型打进日志。
+
+17. **⚠️ 行满自动扩行（`sheet.insertDimension`，且是「尽力而为」）**：当表格贴满到最后一行时（`lastRow+1 >= getRowCount()`，即没有空行），脚本会检测「目标行 + 待录条数 超出总行数」，用 `sheet.insertDimension({index: 总行数, dimensionType: 1, count: 需要行数})` 在末尾内存扩行，再正常粘贴。
+
+    - `dimensionType` 是**数字枚举**：`1` = 行，`0` = 列（实测确认，传字符串 `"ROW"` 等不生效）。
+    - **已知限制**：`insertDimension` 和 `setCellDataAtPosition` 一样**只改内存、不保证提交**（实测刷新后行数回退）。所以脚本把它定位为「尽力而为」：若企微的粘贴提交恰好连带提交扩行，则全自动成功；若没有，**刷新验证会兜底**——数据丢了会报 `persistence_failed` 而不是静默失败。若引擎没暴露 `insertDimension`，则报 `row_full_manual_expand` 提示用户手动加行。
+    - 想做到「真正可靠的行满自动加行」，需走 UI 模拟（点击表格底部加行按钮）或 command/mutation 提交，需在真实行满文档上进一步验证。
+
 ## 故障排查
 
 | 问题 | 原因 | 解决 |
@@ -176,13 +198,16 @@ dev-browser --browser wecom --idle-timeout 30m --timeout 240 run "<skill目录>/
 | SpreadsheetApp undefined | 未登录/页面未加载完 | 等待重试，或截图检查登录状态 |
 | clipboard 返回 err | 页面无焦点/非HTTPS | 确保脚本开篇 cua.click 提供用户手势 |
 | target_row_not_empty | 残留态未清或服务器已有数据 | 重跑（脚本会全新加载）；仍非空则人工核查该行 |
-| alignment_failed | 粘贴锚点偏移 | 看 readback_sample 定位偏几列，检查 TSV 是否 18 列 |
+| alignment_failed | 粘贴锚点偏移（订单号为空不会再触发，已允许空） | 看 readback_sample 定位偏几列，检查 TSV 是否 18 列 |
 | 刷新后数据丢失 | 粘贴没触发提交 | 确认选中了正确单元格再粘贴，重跑 |
 | col17「是否邮件开票」没填上 | TSV 没带 col17 或列数不对 | 确认 read_excel_to_tsv.py 输出了 18 列，且第18列是"是"/空 |
 | 退出码 2 | 发现异常开票人 | 看 stderr 异常明细，转人工，不要录入异常记录 |
 | `sheet.setActiveCell is not a function` | 引擎已移除该 API | 改用 `app.view.setCurrentSelection({yRange:[r,r], xRange:[c,c]})` |
 | 查重漏行 / lastRow 算小 | 数据渐进加载，扫描过早 | 脚本已用 `waitForDataStable` 等 lastRow 稳定；若仍漏，增大轮询次数/间隔 |
 | `Too many arguments` (evaluate) | dev-browser 只允许 1 个参数 | 多参数包成对象 `{start, n}` 传入 |
+| 新文档报 `app_not_ready` | 新文档用了新引擎结构 `app.spreadsheet.sheetManager` | 脚本已做新旧引擎探测兼容，无需手动改；若仍失败看 `engine_api_changed` 的 dump |
+| 表格贴满贴不进（用户需手动加行） | 目标行超出总行数 | 脚本已加行满检测 + `insertDimension` 内存扩行；若引擎无插行 API 会报 `row_full_manual_expand`，仍需手动加行 |
+| 扩行后刷新数据丢失 | `insertDimension` 只改内存未提交 | 属已知限制，脚本会报 `persistence_failed`；可靠方案需 UI 模拟加行或 command 提交 |
 
 ## 批量粘贴注意事项
 
@@ -190,3 +215,32 @@ dev-browser --browser wecom --idle-timeout 30m --timeout 240 run "<skill目录>/
 - 粘贴大量数据（如60行）后脚本等待 3 秒让表格处理完
 - 如果数据量很大（100+行），考虑分批粘贴（每批50行）
 - 符瑞香与伍惠娟的记录会混在同一批里，col17 各自正确填写，无需分两批
+
+## 录入完成后告知用户的话术（订单号为空 / 红冲发票）
+
+当输出 `empty_order_count > 0` 或 `redletter_count > 0` 时，录入照常完成，按下面模板向用户报告（先报结果 → 温和提示 → 给清单）：
+
+**① 订单号为空**
+
+> ⚠️ 其中 {M} 条记录的「订单号」为空（客户要求，属正常情况），已照常录入、没有跳过：
+>
+> | 发票号码 | 情况 |
+> |---|---|
+> | {发票号} | 订单号为空 |
+
+**② 红冲发票（金额为负）**
+
+> ⚠️ 其中 {R} 条为红冲发票（金额为负），已照常录入、未中断：
+>
+> | 发票号码 | 金额 |
+> |---|---|
+> | {发票号} | {负金额} |
+
+统一开头：`✅ 录入完成，{N} 条已同步到企微文档。` 结尾：`其余均正常，不影响本次同步。`
+
+**措辞要点**：
+- 用「订单号为空（客户要求，属正常情况）」「红冲发票（金额为负）」这类中性描述，不要说「异常/错误」。
+- 先报结果再报提示，避免用户误以为出错。
+- 给具体发票号（+ 金额）清单，方便定位核对。
+
+**数据来源**：脚本输出 `empty_order_count` / `empty_order_nums`（订单号空），`redletter_count` / `redletter_list`（红冲，含发票号+金额）。

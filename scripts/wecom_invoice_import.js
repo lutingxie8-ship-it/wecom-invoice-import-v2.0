@@ -7,6 +7,10 @@
 //   2. 输入/输出文件改名，避免与 V1 冲突。
 //   3. 导航 API 从 sheet.setActiveCell 迁移到 app.view.setCurrentSelection（引擎已移除 setActiveCell）。
 //   4. 查重/刷新验证前等待「数据加载稳定」（企微表格数据是渐进加载的，立即扫描会漏行）。
+//   5. 引擎结构探测式兼容：新引擎 app.spreadsheet.sheetManager（getActiveSheetId 是方法），
+//      旧引擎 app.workbook.worksheetManager（activeSheetId 是属性）。两者自动识别，新文档不再 app_not_ready。
+//   6. 行满自动扩行：目标行+待录条数超出总行数时，用 sheet.insertDimension 内存扩行后再粘贴。
+//      注意：insertDimension 只改内存、不保证提交；刷新验证会兜底（数据丢了会明确报错，不静默）。
 //
 // 输入：~/.dev-browser/tmp/wecom_import_v2_input.json
 //   {
@@ -33,6 +37,8 @@
 //   4. 数据渐进加载：企微表格 canvas 数据是异步分批渲染的，goto 后立即 scan 只能读到部分行，
 //      导致 lastRow 算小、漏查重，粘贴时会覆盖还没加载出来的已有数据。
 //      → 查重/刷新验证前必须用 waitForDataStable 轮询到 lastRow 稳定。
+//   5. 引擎结构会变：取 sheet 的入口（workbook.worksheetManager vs spreadsheet.sheetManager）
+//      在不同文档/版本间不一致。→ 统一走 window.__wbSheet.resolve 探测式取 sheet。
 
 var PAGE = "wecom-doc";
 // 真实文档链接不入库：运行时从输入 JSON 的 doc_url 或环境变量 WECOM_DOC_URL 注入。
@@ -72,14 +78,41 @@ if (!input || !input.tsv || !String(input.tsv).trim()) {
   await main();
 }
 
+// 在浏览器全局挂载「探测式取 sheet」的 helper（同 frame 上下文持久，刷新后需重挂）。
+// 兼容新旧引擎：新引擎 app.spreadsheet.sheetManager，旧引擎 app.workbook.worksheetManager。
+async function installHelpers(page) {
+  await page.evaluate(function () {
+    window.__wbSheet = {
+      resolve: function (app) {
+        app = app || window.SpreadsheetApp;
+        // 新引擎
+        if (app.spreadsheet && app.spreadsheet.sheetManager) {
+          var m = app.spreadsheet.sheetManager;
+          var sid = (typeof m.getActiveSheetId === "function") ? m.getActiveSheetId() : m.activeSheetId;
+          var sheet = (typeof m.getSheetBySheetId === "function") ? m.getSheetBySheetId(sid) : null;
+          if (!sheet && typeof m.getActiveSheet === "function") sheet = m.getActiveSheet();
+          return { engine: "new", sheet: sheet };
+        }
+        // 旧引擎
+        if (app.workbook && app.workbook.worksheetManager) {
+          var m2 = app.workbook.worksheetManager;
+          var sid2 = m2.activeSheetId;
+          var sheet2 = m2.getSheetBySheetId(sid2);
+          return { engine: "old", sheet: sheet2 };
+        }
+        return null;
+      }
+    };
+  });
+}
+
 // 全表扫描：读所有现有记录的 发票号码(col4)，并以 col4 为准找最后一条记录所在行。
 // 注意：lastRow 以「发票号码」为锚，而不是「任意列非空」——表格底部可能存在杂散数据
 // （如某处残留的日期 2099/12/31），用任意列会把它误判成最后一行，导致粘贴位置错误。
 async function fullScan(page) {
   return await page.evaluate(function () {
     var app = window.SpreadsheetApp;
-    var sid = app.workbook.worksheetManager.activeSheetId;
-    var sheet = app.workbook.worksheetManager.getSheetBySheetId(sid);
+    var sheet = window.__wbSheet.resolve(app).sheet;
     var total = sheet.getRowCount();
     var existingNums = [];
     var lastRow = 0;
@@ -109,19 +142,21 @@ async function waitForDataStable(page, maxAttempts) {
   return scan;
 }
 
-// 探活：轮询等待 app.view 就绪（它是异步初始化的），再检查关键接口 + 判定导航方式（兼容新旧引擎）。轻量、毫秒级。
+// 探活：轮询等待 app.view 就绪（它是异步初始化的），再检查关键接口 + 判定导航方式（兼容新旧引擎）。
+// 额外返回 engine 类型与是否支持 insertDimension（行满时用，可选能力，缺失不阻断）。
 async function probeEngine(page, timeoutMs) {
   var start = Date.now();
   var last = null;
   while (Date.now() - start < timeoutMs) {
     last = await page.evaluate(function () {
       var app = window.SpreadsheetApp;
-      var sid = app.workbook.worksheetManager.activeSheetId;
-      var sheet = app.workbook.worksheetManager.getSheetBySheetId(sid);
+      var s = window.__wbSheet.resolve(app);
+      var sheet = s.sheet;
       var view = app.view;
       function has(o, k) { return o && typeof o[k] === "function"; }
 
       var missing = [];
+      if (!sheet) missing.push("sheet 对象（新旧引擎都取不到）");
       if (!has(sheet, "getCellDataAtPosition")) missing.push("sheet.getCellDataAtPosition");
       if (!has(sheet, "getRowCount")) missing.push("sheet.getRowCount");
       if (!has(sheet, "setCellDataAtPosition")) missing.push("sheet.setCellDataAtPosition");
@@ -133,24 +168,29 @@ async function probeEngine(page, timeoutMs) {
       var nav = hasNewNav ? "setCurrentSelection" : (hasOldNav ? "setActiveCell" : null);
       if (!nav) missing.push("导航接口(view.setCurrentSelection / sheet.setActiveCell)");
 
-      return { missing: missing, nav: nav };
+      return {
+        missing: missing,
+        nav: nav,
+        engine: s.engine,
+        canInsertDimension: has(sheet, "insertDimension")
+      };
     });
     // view 就绪且导航方式确定 → 通过
     if (last.nav && last.missing.length === 0) {
-      return { ok: true, missing: [], nav: last.nav };
+      return { ok: true, missing: [], nav: last.nav, engine: last.engine, canInsertDimension: last.canInsertDimension };
     }
     await page.waitForTimeout(500);
   }
   // 超时仍不满足 → 报异常
-  return { ok: false, missing: last ? last.missing : [], nav: last ? last.nav : null };
+  return { ok: false, missing: last ? last.missing : [], nav: last ? last.nav : null, engine: last ? last.engine : null, canInsertDimension: last ? last.canInsertDimension : false };
 }
 
 // dump 详情：仅在探活发现接口缺失/异常时调用，把 sheet/view 的方法与相关函数源码倒出来，便于定位新写法。
 async function dumpEngine(page) {
   return await page.evaluate(function () {
     var app = window.SpreadsheetApp;
-    var sid = app.workbook.worksheetManager.activeSheetId;
-    var sheet = app.workbook.worksheetManager.getSheetBySheetId(sid);
+    var s = window.__wbSheet.resolve(app);
+    var sheet = s.sheet;
     var view = app.view;
     function methodNames(o) {
       var m = [];
@@ -162,12 +202,14 @@ async function dumpEngine(page) {
       return o && typeof o[k] === "function" ? String(o[k]).slice(0, 500) : null;
     }
     return {
+      engine: s.engine,
       sheetType: sheet && sheet.getSheetType ? sheet.getSheetType() : null,
       sheetMethods: methodNames(sheet),
       viewMethods: methodNames(view),
       setCurrentSelectionSrc: src(view, "setCurrentSelection"),
       setSelectionSrc: src(view, "setSelection"),
-      setActiveCellSrc: src(sheet, "setActiveCell")
+      setActiveCellSrc: src(sheet, "setActiveCell"),
+      insertDimensionSrc: src(sheet, "insertDimension")
     };
   });
 }
@@ -206,6 +248,9 @@ async function main() {
   }
   console.log("  ✓ 引擎+Sheet 就绪");
 
+  // 挂载探测式取 sheet 的 helper（后续所有 evaluate 依赖它）
+  await installHelpers(page);
+
   // ---- 接口探活：动手前先确认关键接口都在、并确定导航方式（轮询等 view 就绪）----
   var probe = await probeEngine(page, 15000);
   if (!probe.ok) {
@@ -218,7 +263,7 @@ async function main() {
     });
     return;
   }
-  console.log("  ✓ 接口探活通过，导航方式: " + probe.nav);
+  console.log("  ✓ 接口探活通过，引擎: " + probe.engine + "，导航方式: " + probe.nav + "，支持插行: " + probe.canInsertDimension);
 
   // ---- 全表查重（等待数据加载稳定后扫描）----
   step(3, TOTAL, "全表查重（等待数据加载稳定，读现有发票号码比对）...");
@@ -274,8 +319,35 @@ async function main() {
     }
   }
 
-  // ---- 导航到 lastRow+1 空行（按探活结果选导航方式）----
+  // ---- 行满检测 + 自动扩行（在导航前）----
   var targetRow = scan.lastRow + 1;
+  var needExpand = 0;
+  if (pasteCount > 0 && targetRow + pasteCount - 1 >= scan.total) {
+    needExpand = (targetRow + pasteCount) - scan.total;
+  }
+  if (needExpand > 0) {
+    if (!probe.canInsertDimension) {
+      out({
+        status: "row_full_manual_expand",
+        target_row: targetRow,
+        total: scan.total,
+        need_rows: needExpand,
+        hint: "表格行满（目标行 + 待录条数超出总行数），且当前引擎未暴露插入行 API，请手动在表格底部添加至少 " + needExpand + " 行后重试。"
+      });
+      return;
+    }
+    console.log("  ⚠️ 表格行满，自动扩行 " + needExpand + " 行（insertDimension 内存扩行）...");
+    var expandTotal = await page.evaluate(function (args) {
+      var app = window.SpreadsheetApp;
+      var sheet = window.__wbSheet.resolve(app).sheet;
+      var total = sheet.getRowCount();
+      sheet.insertDimension({ index: total, dimensionType: 1, count: args.need });
+      return sheet.getRowCount();
+    }, { need: needExpand });
+    console.log("  内存扩行完成，总行数 " + (expandTotal - needExpand) + " → " + expandTotal);
+  }
+
+  // ---- 导航到 targetRow 空行（按探活结果选导航方式）----
   step(4, TOTAL, "导航到空行 row " + targetRow + "（" + probe.nav + " 直跳）...");
   await page.cua.click({ x: 25, y: 200 });
   await page.waitForTimeout(500);
@@ -287,8 +359,7 @@ async function main() {
   } else if (probe.nav === "setActiveCell") {
     await page.evaluate(function (r) {
       var app = window.SpreadsheetApp;
-      var sid = app.workbook.worksheetManager.activeSheetId;
-      var sheet = app.workbook.worksheetManager.getSheetBySheetId(sid);
+      var sheet = window.__wbSheet.resolve(app).sheet;
       sheet.setActiveCell(r, 0);
     }, targetRow);
   }
@@ -298,8 +369,7 @@ async function main() {
   step(5, TOTAL, "粘贴前校验目标行 row " + targetRow + " 为空（防幽灵粘贴）...");
   var preCheck = await page.evaluate(function (r) {
     var app = window.SpreadsheetApp;
-    var sid = app.workbook.worksheetManager.activeSheetId;
-    var sheet = app.workbook.worksheetManager.getSheetBySheetId(sid);
+    var sheet = window.__wbSheet.resolve(app).sheet;
     var nonEmpty = 0;
     for (var c = 0; c < 18; c++) {
       var cell = sheet.getCellDataAtPosition(r, c);
@@ -334,8 +404,7 @@ async function main() {
   var readBack = await page.evaluate(function (args) {
     var start = args.start, n = args.n;
     var app = window.SpreadsheetApp;
-    var sid = app.workbook.worksheetManager.activeSheetId;
-    var sheet = app.workbook.worksheetManager.getSheetBySheetId(sid);
+    var sheet = window.__wbSheet.resolve(app).sheet;
     var rows = [];
     for (var r = start; r < start + n; r++) {
       var row = [];
@@ -349,18 +418,38 @@ async function main() {
   }, { start: targetRow, n: pasteCount });
 
   var aligned = 0;
+  var emptyOrderCount = 0;
+  var emptyOrderNums = [];
+  var redletterCount = 0;
+  var redletterList = [];
   for (var k = 0; k < readBack.length; k++) {
     var rb = readBack[k];
     var exp = lines[k];
     var dateOk = rb[2] && rb[2] !== "";
     var numOk = rb[4] && /^\d{8,}$/.test(String(rb[4]));
-    var orderOk = rb[9] && rb[9] !== "";
     var expMail = (exp[MAIL_COL] || "");
     var gotMail = (rb[MAIL_COL] || "");
     var mailOk = gotMail === expMail;
-    if (dateOk && numOk && orderOk && mailOk) aligned++;
+    // 订单号允许为空（客户要求），不再作为对齐判据，只统计空订单号的条数供后续告知
+    if (!(exp[ORDER_COL] || "").trim()) {
+      emptyOrderCount++;
+      emptyOrderNums.push(exp[NUM_COL] || "");
+    }
+    // 红冲发票：金额为负（col8），照常录入、不中断，只统计供事后汇报
+    var amt = (exp[8] || "").trim();
+    if (amt.indexOf("-") === 0) {
+      redletterCount++;
+      redletterList.push({ num: exp[NUM_COL] || "", amount: amt });
+    }
+    if (dateOk && numOk && mailOk) aligned++;
   }
   console.log("  列对齐 " + aligned + "/" + pasteCount + " 条");
+  if (emptyOrderCount > 0) {
+    console.log("  ⚠️ 有 " + emptyOrderCount + " 条记录订单号为空（客户要求），已照常录入");
+  }
+  if (redletterCount > 0) {
+    console.log("  ⚠️ 有 " + redletterCount + " 条红冲发票（金额为负），已照常录入");
+  }
   if (aligned < pasteCount) {
     out({
       status: "alignment_failed",
@@ -382,13 +471,14 @@ async function main() {
     out({ status: "persistence_check_failed", detail: "刷新后引擎未就绪", target_row: targetRow, pasted: pasteCount });
     return;
   }
+  // 刷新后重新挂 helper（goto 会重置 window 全局）
+  await installHelpers(page);
   // 刷新后同样等待数据加载稳定，再读回粘贴行
   await waitForDataStable(page, 15);
   var persist = await page.evaluate(function (args) {
     var start = args.start, n = args.n;
     var app = window.SpreadsheetApp;
-    var sid = app.workbook.worksheetManager.activeSheetId;
-    var sheet = app.workbook.worksheetManager.getSheetBySheetId(sid);
+    var sheet = window.__wbSheet.resolve(app).sheet;
     var stillThere = 0;
     for (var r = start; r < start + n; r++) {
       var nCell = sheet.getCellDataAtPosition(r, 4);
@@ -399,6 +489,19 @@ async function main() {
   }, { start: targetRow, n: pasteCount });
 
   var persistOk = persist === pasteCount;
+  var anomalyNote = emptyOrderCount > 0
+    ? "；⚠️ 其中 " + emptyOrderCount + " 条订单号为空（客户要求，已照常录入）"
+    : "";
+  var redletterNote = redletterCount > 0
+    ? "；⚠️ 其中 " + redletterCount + " 条为红冲发票（金额为负），已照常录入"
+    : "";
+  var expandNote = needExpand > 0
+    ? "；ℹ️ 本次曾自动扩行 " + needExpand + " 行"
+    : "";
+  var persistHint = persistOk
+    ? "录入成功并已持久化。" + pasteCount + " 条落位 row " + targetRow + "-" + (targetRow + pasteCount - 1) + "（其中邮件开票=是 " + mailCount + " 条）" + anomalyNote + redletterNote + expandNote
+    : "持久化异常：预期 " + pasteCount + " 条，刷新后实读 " + persist + " 条，请人工核查" +
+      (needExpand > 0 ? "（本次曾内存扩行，若扩行未持久化会导致数据丢失，请确认表格底部是否已自动加行）" : "");
   out({
     status: persistOk ? "success" : "persistence_failed",
     tsv_total: tsvNums.length,
@@ -411,21 +514,27 @@ async function main() {
     aligned: aligned,
     persisted: persist,
     persistence_ok: persistOk,
-    detail: persistOk
-      ? "录入成功并已持久化。" + pasteCount + " 条落位 row " + targetRow + "-" + (targetRow + pasteCount - 1) + "（其中邮件开票=是 " + mailCount + " 条）"
-      : "持久化异常：预期 " + pasteCount + " 条，刷新后实读 " + persist + " 条，请人工核查"
+    expanded_rows: needExpand,
+    empty_order_count: emptyOrderCount,
+    empty_order_nums: emptyOrderNums,
+    redletter_count: redletterCount,
+    redletter_list: redletterList,
+    detail: persistHint
   });
 }
 
-// ---- 等待引擎就绪（轮询，非盲等）----
+// ---- 等待引擎就绪（轮询，非盲等）—— 兼容新旧引擎 ----
 async function waitForAppReady(page, timeoutMs) {
   var start = Date.now();
   while (Date.now() - start < timeoutMs) {
     var ok = await page.evaluate(function () {
-      return typeof window.SpreadsheetApp !== "undefined"
-        && window.SpreadsheetApp
-        && !!window.SpreadsheetApp.workbook
-        && !!window.SpreadsheetApp.workbook.worksheetManager;
+      var app = window.SpreadsheetApp;
+      if (!app) return false;
+      // 新引擎
+      if (app.spreadsheet && app.spreadsheet.sheetManager) return true;
+      // 旧引擎
+      if (app.workbook && app.workbook.worksheetManager) return true;
+      return false;
     });
     if (ok) return { ok: true, elapsed: Date.now() - start };
     await page.waitForTimeout(300);
@@ -439,8 +548,15 @@ async function waitForSheetReady(page, timeoutMs) {
     var ok = await page.evaluate(function () {
       try {
         var app = window.SpreadsheetApp;
-        var sid = app.workbook.worksheetManager.activeSheetId;
-        var sheet = app.workbook.worksheetManager.getSheetBySheetId(sid);
+        var sheet = null;
+        if (app.spreadsheet && app.spreadsheet.sheetManager) {
+          var m = app.spreadsheet.sheetManager;
+          var sid = (typeof m.getActiveSheetId === "function") ? m.getActiveSheetId() : m.activeSheetId;
+          sheet = m.getSheetBySheetId(sid);
+        } else if (app.workbook && app.workbook.worksheetManager) {
+          var m2 = app.workbook.worksheetManager;
+          sheet = m2.getSheetBySheetId(m2.activeSheetId);
+        }
         return !!(sheet && typeof sheet.getRowCount === "function");
       } catch (e) { return false; }
     });
